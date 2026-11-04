@@ -1,0 +1,50 @@
+name: ulai-voice-studio
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: studio
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: studio
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studio -d studio"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      additional_contexts:
+        ulai_sdk: ${ULAI_SDK_PATH:-../ulai-cloud-python-sdk}
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://studio:${POSTGRES_PASSWORD}@db:5432/studio
+    volumes:
+      # The Google service account key (credentials/google-service-account.json), read-only.
+      - ./credentials:/app/credentials:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    # Not published: only the frontend talks to it.
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "${STUDIO_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  db-data:

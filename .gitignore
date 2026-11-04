@@ -1,0 +1,26 @@
+# Secrets: the Google service account and local env files never go into git.
+credentials/*
+!credentials/README.md
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+
+.DS_Store
+
+# Local SQLite database (local runs only)
+*.db
+*.db-journal
