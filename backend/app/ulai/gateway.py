@@ -174,7 +174,6 @@ class SdkGateway:
         self.project_id: str | None = None
         self._client: Any = None
         self._lock = asyncio.Lock()
-        self._http = httpx.AsyncClient(timeout=15)
         self._agents: ua.Client | None = None
 
     def _agent_client(self) -> ua.Client:
@@ -203,6 +202,7 @@ class SdkGateway:
                 control_plane_url=s.ulai_cp_url,
                 api_key=s.ulai_api_key.get_secret_value(),
                 system_secret=s.ulai_system_secret.get_secret_value() or None,
+                sip_originate_url=s.ulai_sip_originate_url,
             )
             try:
                 await client.__aenter__()
@@ -227,7 +227,6 @@ class SdkGateway:
         return self.project_id or ""
 
     async def close(self) -> None:
-        await self._http.aclose()
         if self._agents is not None:
             await self._agents.close()
         if self._client is not None:
@@ -307,27 +306,20 @@ class SdkGateway:
                 yield msg
 
     async def originate(self, *, session_id, trunk_id, to_number, from_number) -> None:
-        # The SDK's originate_call posts to a hard-coded address; this uses the configured one.
-        client = await self._ready()
-        headers = {"Authorization": f"Bearer {self.settings.ulai_api_key.get_secret_value()}"}
-        if secret := self.settings.ulai_system_secret.get_secret_value():
-            headers["X-System-Secret"] = secret
-        payload = {
-            "to_number": to_number,
-            "trunk_id": trunk_id,
-            "project_id": client.project_id,
-            "from_number": from_number,
-            "name": to_number,
-            "offer_srtp": False,
-            "require_srtp": False,
-            "dial_verbatim": False,
-            "session_id": session_id,
-        }
-        try:
-            resp = await self._http.post(self.settings.ulai_sip_originate_url, json=payload, headers=headers)
-            resp.raise_for_status()
-        except httpx.HTTPError as err:
-            raise UlaiError(_describe(err)) from err
+        # Posts to ULAI_SIP_ORIGINATE_URL, which the client was made with.
+        await self._do(
+            lambda c: c.sip.originate_call(
+                to_number=to_number,
+                trunk_id=trunk_id,
+                project_id=c.project_id,
+                from_number=from_number,
+                name=to_number,
+                offer_srtp=False,
+                require_srtp=False,
+                dial_verbatim=False,
+                session_id=session_id,
+            )
+        )
 
     # ----- following a call's agent -----
 

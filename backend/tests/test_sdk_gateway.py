@@ -1,10 +1,13 @@
-"""SdkGateway against a real gRPC agent server: what the studio sends through ulai-agents, over the wire."""
+"""SdkGateway against a real gRPC agent server: what the studio sends through ulai-agents, over the wire.
+Also dialling, through ulai-api, against a fake HTTP transport."""
 
 import json
 
 import grpc
+import httpx
 import pytest
 import ulai_agents as ua
+from pydantic import SecretStr
 from ulai.agent.v1 import agent_pb2 as pb
 from ulai.agent.v1 import agent_pb2_grpc as rpc
 
@@ -135,3 +138,35 @@ def test_an_agent_without_google_credentials_is_refused_before_dialling(settings
     agent = build_agent(_agent(), settings, {}, direction="web")
     with pytest.raises(ua.ValidationError, match="Agent.cloud"):
         agent.validate(allow_unlisted_values=True)
+
+
+async def test_originate_dials_through_ulai_api_at_the_configured_url(settings, monkeypatch):
+    settings.ulai_sip_originate_url = "https://sip.test/sip/originate"
+    settings.ulai_system_secret = SecretStr("sys-secret")
+    requests: list[httpx.Request] = []
+
+    def ulai(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/v1/auth/me":
+            return httpx.Response(200, json={"project_id": "proj-1"})
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(ulai), **kw)
+    )
+    gw = SdkGateway(settings)
+    try:
+        await gw.originate(session_id="sess-1", trunk_id="trunk-1", to_number="+1555", from_number="+1666")
+    finally:
+        await gw.close()
+
+    dial = requests[-1]
+    assert str(dial.url) == "https://sip.test/sip/originate"
+    assert (
+        dial.headers["authorization"] == "Bearer ulai_test"
+        and dial.headers["x-system-secret"] == "sys-secret"
+    )
+    body = json.loads(dial.content)
+    assert body["session_id"] == "sess-1" and body["trunk_id"] == "trunk-1" and body["project_id"] == "proj-1"
+    assert (body["to_number"], body["from_number"]) == ("+1555", "+1666")
