@@ -2,7 +2,7 @@
 
 Build, test and run AI voice agents on **Ulai Voice Infra**: design an agent, talk to it in the browser, give it phone numbers, and place calls through your SIP trunks. Every call keeps its live transcript, tool calls and outcome.
 
-One admin account, no sign-up. No LiveKit anywhere (`scripts/check-no-livekit.sh` enforces it).
+One admin account, no sign-up.
 
 ## What's in it
 
@@ -64,9 +64,6 @@ python3.11 -m venv .venv
 cd frontend
 npm install
 npm run dev                              # http://localhost:3000, proxies /api to BACKEND_URL (default :8000)
-
-# Whole repo
-./scripts/check-no-livekit.sh
 ```
 
 ## Security notes

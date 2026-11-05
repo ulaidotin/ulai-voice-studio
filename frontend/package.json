@@ -7,8 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit",
-    "check:no-livekit": "node scripts/check-no-livekit.mjs"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@radix-ui/react-alert-dialog": "^1.2.1",
