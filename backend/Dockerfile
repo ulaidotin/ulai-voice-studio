@@ -4,6 +4,8 @@
 
 FROM python:3.11-slim AS build
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+# ulai-agents and its protocol package install from GitHub.
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 RUN python -m venv /venv
 ENV PATH=/venv/bin:$PATH
 WORKDIR /src

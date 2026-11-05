@@ -16,8 +16,11 @@ dependencies = [
     "bcrypt>=4.1",
     "pyjwt>=2.8",
     "phonenumbers>=8.13",
+    # Agents: the ulai-agents SDK and the ulai.agent.v1 protocol it speaks, pinned to the tested commits.
+    "ulai-agents @ git+https://github.com/ulaidotin/agent-sdk-python.git@b8608aabfe8aa9209f94b8b2d6c6fd24622b3ab0",
+    "ulai-agent-protocol @ git+https://github.com/ulaidotin/ulai-agent-protocol.git@b6cc30c24b077407261a479ee92fec9fc660c7db#subdirectory=python",
     # The Ulai Python SDK (ulai-api) is private and installed separately:
-    # locally `pip install -e ../../ulai-cloud-python-sdk`, in Docker from GitHub over SSH.
+    # locally `pip install -e ../../ulai-cloud-python-sdk`, in Docker from the "ulai_sdk" build context.
 ]
 
 [project.optional-dependencies]

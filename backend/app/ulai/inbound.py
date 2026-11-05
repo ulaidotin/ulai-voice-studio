@@ -1,4 +1,9 @@
-"""Answers inbound phone calls: subscribes to the calls Ulai assigns to our agents."""
+"""Answers inbound phone calls.
+
+A trunk's dispatch rule names the studio agent for its numbers. When a call arrives, Ulai's SIP gateway puts
+the caller into a new session, carrying that agent in its join metadata; the control plane announces the
+join on our project's event feed, and the studio puts the agent into the session, as for an outbound call.
+"""
 
 import asyncio
 import logging
@@ -8,9 +13,27 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..models import Trunk, TrunkDirection
 from .calls import CallManager
-from .gateway import Gateway
+from .gateway import AGENT_METADATA_KEY, Gateway
 
 log = logging.getLogger(__name__)
+
+# Where an inbound caller's join metadata names the agent: the SIP gateway sets assigned_agent from the
+# rule's agent_name; the rule's dispatch_metadata carries AGENT_METADATA_KEY too.
+_AGENT_KEYS = ("assigned_agent", AGENT_METADATA_KEY)
+
+
+def inbound_call(msg: dict) -> tuple[str, str, str, str] | None:
+    """(session_id, agent_id, from_number, to_number) when msg is a phone caller arriving for an agent."""
+    meta = msg.get("metadata") or {}
+    if msg.get("type") != "participant_joined" or msg.get("kind") != "SIP":
+        return None
+    if msg.get("sip_direction") != "INBOUND" and meta.get("direction") != "inbound":
+        return None
+    agent_id = next((meta[k] for k in _AGENT_KEYS if meta.get(k)), "")
+    if not agent_id or not msg.get("session_id"):
+        return None
+    # The caller's number, and the number they dialled.
+    return msg["session_id"], agent_id, meta.get("caller_id", ""), meta.get("phone_number", "")
 
 
 class InboundListener:
@@ -22,6 +45,8 @@ class InboundListener:
         self.last_error = ""
         self._changed = asyncio.Event()
         self._task: asyncio.Task | None = None
+        # The feed's last event, so a reconnect resumes without missing a call.
+        self._last_event_id: str | None = None
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run())
@@ -32,7 +57,7 @@ class InboundListener:
             await asyncio.gather(self._task, return_exceptions=True)
 
     def refresh(self) -> None:
-        """Call after inbound routing changes, so the subscription covers the right agents."""
+        """Call after inbound routing changes, so the listener answers for the right agents."""
         self._changed.set()
 
     async def _agent_ids(self) -> list[str]:
@@ -78,9 +103,14 @@ class InboundListener:
 
     async def _listen(self, agent_ids: list[str]) -> None:
         log.info("listening for inbound calls for %d agent(s)", len(agent_ids))
+        ours = set(agent_ids)
         self.state, self.last_error = "running", ""
-        async for a in self.gateway.assignments(agent_ids):
+        async for msg in self.gateway.project_events(self._last_event_id):
+            self._last_event_id = msg.get("id") or self._last_event_id
+            call = inbound_call(msg)
+            if call is None or call[1] not in ours:
+                continue  # not a phone call, or another app's agent on the same project
             try:
-                await self.calls.accept_inbound(a.session_id, a.call)
+                await self.calls.accept_inbound(*call)
             except Exception:
-                log.exception("couldn't take inbound call %s", a.session_id)
+                log.exception("couldn't take inbound call %s", call[0])

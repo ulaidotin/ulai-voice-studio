@@ -1,19 +1,20 @@
 """Starts calls on Ulai and follows each one live until it ends.
 
-Each call gets a monitor task that:
-  * attaches to the agent's event stream: transcript, tool calls, usage, the end of the call;
+Every call, web, outbound or inbound, puts the agent into the call's session with ulai-agents. Each call
+then gets a monitor task that:
+  * attaches to the agent: transcript, usage, the end of the call, answering its tools as they're called;
   * for phone calls, also watches the session on the control plane, to see the callee pick up or hang up;
   * for outbound calls, ends the call if nobody answers within the ring timeout.
 Everything worth keeping is written to the database and published to the Hub for the UI.
 """
 
 import asyncio
-import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
+import ulai_agents as ua
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -29,14 +30,14 @@ from ..models import (
     CallStatus,
     Trunk,
 )
-from .gateway import Gateway, UlaiError, quietly
+from .gateway import CallGone, Gateway, UlaiError, quietly
 from .hub import Hub
-from .profile import build_profile, builtins, call_variables
+from .profile import ToolAnswer, build_agent, build_tools, builtins, call_variables
 from .tools import run_tool
 
 log = logging.getLogger(__name__)
 
-# Attempts to (re)attach to a call's agent stream before giving up on following it.
+# Attempts to (re)attach to a call's agent before giving up on following it.
 ATTACH_ATTEMPTS = 6
 # After the caller hangs up, how long to wait for the agent to report the end before ending it ourselves.
 HANGUP_GRACE_SECONDS = 8
@@ -46,9 +47,8 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _speaker(value: int) -> str:
-    # Speaker enum: 1 = caller, 2 = agent
-    return {1: "caller", 2: "agent"}.get(value, "unknown")
+def _ms(elapsed: timedelta) -> int | None:
+    return int(elapsed.total_seconds() * 1000) if elapsed else None
 
 
 class CallManager:
@@ -67,14 +67,14 @@ class CallManager:
     async def start_web_call(self, agent: Agent, variables: dict[str, str]) -> schemas.WebCallOut:
         call = await self._new_call(agent, CallDirection.WEB, variables=variables)
         values = call_variables(agent, variables, builtins(direction="web"))
-        profile = build_profile(agent, self.settings, values, direction="web")
         try:
-            session_id = await self._open_session(call, agent, profile)
+            ua_agent = build_agent(agent, self.settings, values, direction="web")
+            session_id = await self._open_session(call, ua_agent)
             join = await self.gateway.join_user(session_id, participant_id=f"web-{call.id[:8]}")
         except UlaiError as err:
             await self._fail(call.id, str(err))
             raise
-        self._spawn(call.id, session_id, agent.tools, profile=None, phone=False)
+        self._spawn(call.id, session_id, agent.tools, phone=False)
         return schemas.WebCallOut(
             call_id=call.id,
             session_id=session_id,
@@ -98,14 +98,15 @@ class CallManager:
             to_number=to_number,
         )
         values = call_variables(agent, variables, builtins(direction="outbound", to_number=to_number))
-        profile = build_profile(agent, self.settings, values, direction="outbound")
         try:
-            session_id = await self._open_session(call, agent, profile)
+            session_id = await self._open_session(
+                call, build_agent(agent, self.settings, values, direction="outbound")
+            )
         except UlaiError as err:
             await self._fail(call.id, str(err))
             raise
         # Follow the call before dialling, so we can't miss the pick-up.
-        self._spawn(call.id, session_id, agent.tools, profile=None, phone=True)
+        self._spawn(call.id, session_id, agent.tools, phone=True)
         try:
             await self.gateway.originate(
                 session_id=session_id,
@@ -120,34 +121,42 @@ class CallManager:
         await self._set_status(call.id, CallStatus.RINGING, f"Dialling {to_number}")
         return await self._get(call.id)
 
-    async def accept_inbound(self, session_id: str, info: Any) -> None:
-        """Takes a call Ulai assigned to one of our agents (a dispatch rule matched its number)."""
+    async def accept_inbound(self, session_id: str, agent_id: str, from_number: str, to_number: str) -> bool:
+        """Answers a phone call a dispatch rule routed to one of our agents, now that its caller is in the
+        session: puts the agent in, as for an outbound call. False when it isn't ours to answer."""
         async with self.db() as db:
-            agent = await db.get(Agent, info.agent_id)
+            agent = await db.get(Agent, agent_id)
             if agent is None:
-                log.warning("inbound call %s for unknown agent %s", session_id, info.agent_id)
-                return
+                log.info("inbound call %s is for agent %s, which isn't one of ours", session_id, agent_id)
+                return False
             existing = await db.scalar(select(Call).where(Call.session_id == session_id))
             if existing is not None:
-                return
-            trunk = await self._trunk_for_number(db, info.to_number)
+                return False
+            trunk = await self._trunk_for_number(db, to_number)
         call = await self._new_call(
             agent,
             CallDirection.INBOUND,
             session_id=session_id,
             trunk_id=trunk.id if trunk else None,
-            from_number=info.from_number,
-            to_number=info.to_number,
+            from_number=from_number,
+            to_number=to_number,
             status=CallStatus.IN_PROGRESS,
             answered=True,
         )
+        await self._add_event(call.id, CallEventKind.STATUS, text=f"Incoming call from {from_number}")
         values = call_variables(
-            agent, {}, builtins(direction="inbound", from_number=info.from_number, to_number=info.to_number)
+            agent, {}, builtins(direction="inbound", from_number=from_number, to_number=to_number)
         )
-        profile = build_profile(agent, self.settings, values, direction="inbound")
-        # Inbound calls get their configuration on attach, since we never joined the agent ourselves.
-        self._spawn(call.id, session_id, agent.tools, profile=profile, phone=True)
-        await self._add_event(call.id, CallEventKind.STATUS, text=f"Incoming call from {info.from_number}")
+        try:
+            ua_agent = build_agent(agent, self.settings, values, direction="inbound")
+            await self._join_agent(call, ua_agent, session_id)
+        except UlaiError as err:
+            # Nobody will answer the caller; hang up rather than leave them in silence.
+            await quietly(self.gateway.terminate_session(session_id))
+            await self._fail(call.id, f"Couldn't start the agent: {err}")
+            return True
+        self._spawn(call.id, session_id, agent.tools, phone=True)
+        return True
 
     async def end_call(self, call_id: str) -> Call:
         call = await self._get(call_id)
@@ -177,13 +186,8 @@ class CallManager:
                 continue
             async with self.db() as db:
                 agent = await db.get(Agent, agent_id) if agent_id else None
-            self._spawn(
-                call_id,
-                session_id,
-                agent.tools if agent else [],
-                profile=None,
-                phone=direction != CallDirection.WEB,
-            )
+            tools = agent.tools if agent else []
+            self._spawn(call_id, session_id, tools, phone=direction != CallDirection.WEB)
 
     async def shutdown(self) -> None:
         # Detaching doesn't end calls; they carry on and are resumed on the next start.
@@ -221,7 +225,8 @@ class CallManager:
         self._publish_call(call)
         return call
 
-    async def _open_session(self, call: Call, agent: Agent, profile: dict) -> str:
+    async def _open_session(self, call: Call, agent: ua.Agent) -> str:
+        """Creates the call's session and puts the agent in it."""
         session_id = await self.gateway.create_session(
             {
                 "call_id": call.id,
@@ -230,6 +235,14 @@ class CallManager:
                 "app": "ulai-voice-studio",
             }
         )
+        try:
+            await self._join_agent(call, agent, session_id)
+        except UlaiError:
+            await quietly(self.gateway.terminate_session(session_id))
+            raise
+        return session_id
+
+    async def _join_agent(self, call: Call, agent: ua.Agent, session_id: str) -> None:
         participant = f"agent-{call.id[:8]}"
         async with self.db() as db:
             await db.execute(
@@ -238,35 +251,21 @@ class CallManager:
                 .values(session_id=session_id, agent_participant_id=participant)
             )
             await db.commit()
-        try:
-            await self.gateway.join_agent(
-                session_id,
-                agent_id=agent.id,
-                participant_id=participant,
-                profile=profile,
-                custom_fields={
-                    "call_id": call.id,
-                    "direction": call.direction.value,
-                    **(call.variables or {}),
-                },
-            )
-        except UlaiError:
-            await quietly(self.gateway.terminate_session(session_id))
-            raise
-        return session_id
+        await self.gateway.join_agent(
+            session_id,
+            agent,
+            participant_id=participant,
+            fields={"call_id": call.id, "direction": call.direction.value, **(call.variables or {})},
+        )
 
-    def _spawn(
-        self, call_id: str, session_id: str, tools: list, *, profile: dict | None, phone: bool
-    ) -> None:
-        task = asyncio.create_task(self._monitor(call_id, session_id, tools or [], profile, phone))
+    def _spawn(self, call_id: str, session_id: str, tools: list, *, phone: bool) -> None:
+        task = asyncio.create_task(self._monitor(call_id, session_id, tools or [], phone))
         self._monitors[call_id] = task
         task.add_done_callback(lambda _t: self._monitors.pop(call_id, None))
 
     # ------------------------------------------------------------------ internals: monitoring
 
-    async def _monitor(
-        self, call_id: str, session_id: str, tools: list, profile: dict | None, phone: bool
-    ) -> None:
+    async def _monitor(self, call_id: str, session_id: str, tools: list, phone: bool) -> None:
         helpers: list[asyncio.Task] = []
         try:
             if phone:
@@ -274,7 +273,7 @@ class CallManager:
             call = await self._get(call_id)
             if call.direction == CallDirection.OUTBOUND:
                 helpers.append(asyncio.create_task(self._ring_timeout(call_id, session_id)))
-            await self._follow_agent(call_id, session_id, tools, profile)
+            await self._follow_agent(call_id, session_id, tools)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -284,98 +283,96 @@ class CallManager:
             for t in helpers:
                 t.cancel()
 
-    async def _follow_agent(self, call_id: str, session_id: str, tools: list, profile: dict | None) -> None:
-        by_name = {t["name"]: t for t in tools}
+    async def _follow_agent(self, call_id: str, session_id: str, tools: list) -> None:
         attempt = 0
         while attempt < ATTACH_ATTEMPTS:
             if (await self._get(call_id)).status.is_final:
                 return
-            stream = None
+            session = None
             try:
-                stream = self.gateway.attach(session_id, profile, list(by_name))
-                async for ev in stream:
+                # A re-attach doesn't replay what was said while we were away: ulai-agents can't replay
+                # history to a client that answers tools, since that would answer past tool calls again.
+                answered = build_tools(tools, self._tool_answer(call_id))
+                session = await self.gateway.attach(session_id, answered)
+                await self._connected(call_id)
+                async for ev in session.events():
                     attempt = 0
-                    if await self._on_agent_event(call_id, ev, stream, by_name):
+                    if await self._on_agent_event(call_id, ev):
                         return
-                # The stream closed without a SessionEnded: the call is over or the stream dropped.
+                # The events ended without an Ended event: the stream dropped.
             except asyncio.CancelledError:
                 raise
+            except CallGone as err:
+                await self._finish(call_id, reason=str(err), failed=err.failed)
+                return
             except Exception as err:
-                log.info("agent stream for call %s: %s", call_id, err)
+                log.info("agent session for call %s: %s", call_id, err)
             finally:
-                if stream is not None:
-                    stream.close()
+                if session is not None:
+                    await session.close()
             attempt += 1
             await asyncio.sleep(min(2**attempt, 15))
         await self._finish(call_id, reason="Lost connection to the agent", failed=True)
 
-    async def _on_agent_event(self, call_id: str, ev: Any, stream: Any, tools: dict) -> bool:
-        """Handles one agent-stream event; returns True once the call has ended."""
-        kind = ev.WhichOneof("event")
+    async def _connected(self, call_id: str) -> None:
+        """A web call is live once we're attached to its agent; a phone call, once its callee answers."""
         call = await self._get(call_id)
-        if ev.sequence and ev.sequence <= call.stream_seq and kind != "session_ended":
-            return False  # replayed on re-attach; already stored
-        elapsed = int(ev.elapsed_ms) if ev.elapsed_ms else None
+        if call.direction == CallDirection.WEB and call.status != CallStatus.IN_PROGRESS:
+            await self._set_status(call_id, CallStatus.IN_PROGRESS, "Connected", answered=True)
 
-        if kind == "session_started":
-            if call.direction == CallDirection.WEB and call.status != CallStatus.IN_PROGRESS:
-                await self._set_status(call_id, CallStatus.IN_PROGRESS, "Connected", answered=True)
-        elif kind == "transcript":
-            t = ev.transcript
-            if not t.text.strip():
+    async def _on_agent_event(self, call_id: str, ev: Any) -> bool:
+        """Handles one ulai_agents event; returns True once the call has ended."""
+        elapsed = _ms(ev.elapsed)
+        if isinstance(ev, ua.Transcript):
+            speaker = ev.speaker.value if ev.speaker else "unknown"
+            if not ev.text.strip():
                 pass
-            elif t.final:
+            elif ev.final:
                 await self._add_event(
                     call_id,
                     CallEventKind.TRANSCRIPT,
-                    speaker=_speaker(t.speaker),
-                    text=t.text.strip(),
+                    speaker=speaker,
+                    text=ev.text.strip(),
                     elapsed_ms=elapsed,
-                    stream_seq=ev.sequence,
                 )
             else:
                 self.hub.publish(
-                    call_id,
-                    {"type": "interim", "call_id": call_id, "speaker": _speaker(t.speaker), "text": t.text},
+                    call_id, {"type": "interim", "call_id": call_id, "speaker": speaker, "text": ev.text}
                 )
-        elif kind == "agent_state":
-            state = {1: "listening", 2: "thinking", 3: "speaking"}.get(ev.agent_state.state)
-            if state:
-                self.hub.publish(call_id, {"type": "agent_state", "call_id": call_id, "state": state})
-        elif kind == "tool_call":
-            asyncio.create_task(self._answer_tool(call_id, ev.tool_call, stream, tools, elapsed, ev.sequence))
-        elif kind == "usage":
-            u = ev.usage
+        elif isinstance(ev, ua.StateChanged):
+            if ev.state:
+                state = {"type": "agent_state", "call_id": call_id, "state": ev.state.value}
+                self.hub.publish(call_id, state)
+        elif isinstance(ev, ua.Usage):
             await self._update(
                 call_id,
                 usage={
-                    "prompt_tokens": u.prompt_total,
-                    "response_tokens": u.response_total,
-                    "cached_tokens": u.prompt_cached,
+                    "prompt_tokens": ev.prompt_total,
+                    "response_tokens": ev.response_total,
+                    "cached_tokens": ev.prompt_cached,
                 },
             )
-        elif kind == "session_ended":
-            e = ev.session_ended
-            await self._finish(call_id, reason=e.reason, disposition=e.disposition)
+        elif isinstance(ev, ua.ToolOutcome):
+            # One of Ulai's own tools, such as ending the call. Ours are recorded as they're answered.
+            await self._add_event(
+                call_id,
+                CallEventKind.TOOL_CALL,
+                text=ev.name,
+                elapsed_ms=elapsed,
+                data={"arguments": ev.args, "result": ev.result, "ok": not ev.error, "by": "ulai"},
+            )
+        elif isinstance(ev, ua.Rejected):
+            log.warning("Ulai refused %s on call %s: %s", ev.command or "a command", call_id, ev.message)
+        elif isinstance(ev, ua.Ended):
+            await self._finish(call_id, reason=ev.reason or ev.end_reason, disposition=ev.disposition)
             return True
-        elif kind == "error":
-            log.warning("agent reported an error on call %s: %s", call_id, ev.error.message)
         return False
 
-    async def _answer_tool(
-        self, call_id: str, tc: Any, stream: Any, tools: dict, elapsed: int | None, seq: int
-    ) -> None:
-        from ulai_api.proto import agent_session_pb2 as pb
+    def _tool_answer(self, call_id: str) -> ToolAnswer:
+        """Answers this call's tools by calling their webhooks, and records each answer."""
 
-        try:
-            args = json.loads(tc.args_json) if tc.args_json else {}
-        except ValueError:
-            args = {}
-        tool = tools.get(tc.name)
-        started = asyncio.get_running_loop().time()
-        if tool is None:
-            result = {"error": f"No tool named {tc.name} is configured."}
-        else:
+        async def answer(tool: dict, args: dict[str, Any]) -> dict:
+            started = asyncio.get_running_loop().time()
             call = await self._get(call_id)
             context = {
                 "call_id": call_id,
@@ -385,18 +382,16 @@ class CallManager:
                 "variables": call.variables,
             }
             result = await run_tool(self.http, tool, args, context)
-        took = int((asyncio.get_running_loop().time() - started) * 1000)
-        stream.send(
-            pb.ClientEvent(tool_result=pb.ToolResult(id=tc.id, name=tc.name, result_json=json.dumps(result)))
-        )
-        await self._add_event(
-            call_id,
-            CallEventKind.TOOL_CALL,
-            text=tc.name,
-            elapsed_ms=elapsed,
-            stream_seq=seq,
-            data={"arguments": args, "result": result, "duration_ms": took, "ok": "error" not in result},
-        )
+            took = int((asyncio.get_running_loop().time() - started) * 1000)
+            await self._add_event(
+                call_id,
+                CallEventKind.TOOL_CALL,
+                text=tool["name"],
+                data={"arguments": args, "result": result, "duration_ms": took, "ok": "error" not in result},
+            )
+            return result
+
+        return answer
 
     async def _watch_session(self, call_id: str, session_id: str) -> None:
         """Follows the phone leg on the control plane: pick-up and hang-up."""
@@ -530,7 +525,6 @@ class CallManager:
         text: str = "",
         data: dict | None = None,
         elapsed_ms: int | None = None,
-        stream_seq: int = 0,
     ) -> None:
         async with self.db() as db:
             if call_id not in self._seq:
@@ -548,12 +542,6 @@ class CallManager:
                 elapsed_ms=elapsed_ms,
             )
             db.add(ev)
-            if stream_seq:
-                await db.execute(
-                    update(Call)
-                    .where(Call.id == call_id, Call.stream_seq < stream_seq)
-                    .values(stream_seq=stream_seq)
-                )
             await db.commit()
             await db.refresh(ev)
         self.hub.publish(

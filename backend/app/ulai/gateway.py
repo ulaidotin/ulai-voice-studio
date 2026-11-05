@@ -1,25 +1,40 @@
-"""The one place that talks to Ulai Voice Infra, through the ulai-api Python SDK.
+"""The one place that talks to Ulai Voice Infra: sessions, trunks and routing through the ulai-api SDK,
+agents through the ulai-agents SDK.
 
 Everything else in the app goes through `Gateway`, so tests can swap in a fake.
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
+import urllib.parse
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
+import ulai_agents as ua
 import websockets
 
 from ..config import Settings
 
 log = logging.getLogger(__name__)
 
+# Dispatch rule metadata naming the studio agent that answers the rule's calls.
+AGENT_METADATA_KEY = "studio_agent_id"
+
 
 class UlaiError(Exception):
     """Ulai refused or failed a request; the message is safe to show the user."""
+
+
+class CallGone(UlaiError):
+    """The call is over, or Ulai dropped it: following it again won't help."""
+
+    def __init__(self, message: str, *, failed: bool):
+        super().__init__(message)
+        self.failed = failed
 
 
 @dataclass
@@ -41,12 +56,11 @@ class RemoteRule:
     id: str
 
 
-class AgentStream(Protocol):
-    """A live connection to one call's agent: events in, control messages out."""
+class AgentSession(Protocol):
+    """One call's agent, attached: its ulai_agents events, with its tools answered in the background."""
 
-    def send(self, event: Any) -> None: ...
-    def close(self) -> None: ...
-    def __aiter__(self) -> AsyncIterator[Any]: ...
+    def events(self) -> AsyncIterator[Any]: ...
+    async def close(self) -> None: ...
 
 
 class Gateway(Protocol):
@@ -58,23 +72,18 @@ class Gateway(Protocol):
     async def create_session(self, metadata: dict[str, str]) -> str: ...
     async def join_user(self, session_id: str, participant_id: str) -> UserJoin: ...
     async def join_agent(
-        self,
-        session_id: str,
-        agent_id: str,
-        participant_id: str,
-        profile: dict,
-        custom_fields: dict,
+        self, session_id: str, agent: ua.Agent, participant_id: str, fields: dict
     ) -> None: ...
     async def leave_agent(self, session_id: str, participant_id: str, reason: str) -> None: ...
     async def terminate_session(self, session_id: str) -> None: ...
     async def watch_session(self, session_id: str) -> str: ...
     def session_events(self, session_id: str, last_event_id: str | None) -> AsyncIterator[dict]: ...
+    def project_events(self, last_event_id: str | None) -> AsyncIterator[dict]: ...
     async def originate(
         self, *, session_id: str, trunk_id: str, to_number: str, from_number: str
     ) -> None: ...
 
-    def attach(self, session_id: str, profile: dict | None, tool_names: list[str]) -> AgentStream: ...
-    def assignments(self, agent_ids: list[str]) -> AsyncIterator[Any]: ...
+    async def attach(self, session_id: str, tools: list[ua.Tool]) -> AgentSession: ...
 
     async def create_inbound_trunk(
         self, name: str, numbers: list[str], allowed: list[str]
@@ -108,41 +117,57 @@ def _describe(err: Exception) -> str:
         return f"Ulai returned {err.response.status_code}: {body}"
     if isinstance(err, httpx.HTTPError):
         return f"Couldn't reach Ulai: {err.__class__.__name__}"
-    code = getattr(err, "code", None)
-    if callable(code):  # grpc.aio.AioRpcError
-        details = getattr(err, "details", lambda: "")()
-        return f"Ulai agent service: {code().name} {details}".strip()
+    if isinstance(err, ua.AgentError):
+        return f"Ulai agent service: {err}"
     return str(err) or err.__class__.__name__
 
 
-class _SdkAgentStream:
-    def __init__(self, sdk_agent: Any, first: Any, tool_names: list[str], pb: Any):
-        self._queue: asyncio.Queue[Any] = asyncio.Queue()
-        self._queue.put_nowait(first)
-        if tool_names:
-            self._queue.put_nowait(pb.ClientEvent(handled_tools=pb.HandledTools(names=tool_names)))
-        self._call = sdk_agent.run(self._requests())
+def agent_server_address(url: str) -> tuple[str, bool]:
+    """The agent server's host:port from ULAI_AGENT_URL, and whether to use TLS.
 
-    async def _requests(self) -> AsyncIterator[Any]:
-        while True:
-            ev = await self._queue.get()
-            if ev is None:
-                return
-            yield ev
+    "https://host" and a bare "host:port" use TLS, except to this machine; "http://host:port" doesn't.
+    """
+    raw = url.strip().rstrip("/")
+    if "://" in raw:
+        parsed = urllib.parse.urlsplit(raw)
+        tls = parsed.scheme != "http"
+        return f"{parsed.hostname}:{parsed.port or (443 if tls else 80)}", tls
+    host = raw.rsplit(":", 1)[0].strip("[]") if ":" in raw else raw
+    return (raw if ":" in raw else f"{raw}:443"), not _is_local(host)
 
-    def send(self, event: Any) -> None:
-        self._queue.put_nowait(event)
 
-    def close(self) -> None:
-        self._queue.put_nowait(None)
-        self._call.cancel()
+def _is_local(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
-    def __aiter__(self) -> AsyncIterator[Any]:
-        return self._call.__aiter__()
+
+def _rule_metadata(agent_id: str) -> dict[str, str]:
+    return {AGENT_METADATA_KEY: agent_id, "app": "ulai-voice-studio"}
+
+
+class _SdkAgentSession:
+    def __init__(self, session: ua.Session):
+        self._session = session
+
+    async def events(self) -> AsyncIterator[Any]:
+        try:
+            async for ev in self._session.events():
+                yield ev
+        except ua.CallLostError as err:
+            raise CallGone(str(err), failed=True) from err
+        except ua.AgentError as err:
+            raise UlaiError(_describe(err)) from err
+
+    async def close(self) -> None:
+        await self._session.close()
 
 
 class SdkGateway:
-    """Gateway backed by the real ulai-api SDK."""
+    """Gateway backed by the real ulai-api and ulai-agents SDKs."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -150,6 +175,17 @@ class SdkGateway:
         self._client: Any = None
         self._lock = asyncio.Lock()
         self._http = httpx.AsyncClient(timeout=15)
+        self._agents: ua.Client | None = None
+
+    def _agent_client(self) -> ua.Client:
+        # ulai_agents.Client doesn't dial until first used, so making it here costs nothing.
+        if self._agents is None:
+            s = self.settings
+            address, tls = agent_server_address(s.ulai_agent_url)
+            key = s.ulai_agent_api_key.get_secret_value() or s.ulai_api_key.get_secret_value()
+            # An explicit http:// URL means the operator trusts the network to the agent server.
+            self._agents = ua.Client(address, api_key=key or None, tls=tls, insecure=not tls)
+        return self._agents
 
     async def _ready(self) -> Any:
         if self._client is not None:
@@ -165,9 +201,7 @@ class SdkGateway:
             client = UlaiClient(
                 backend_url=s.ulai_api_url,
                 control_plane_url=s.ulai_cp_url,
-                agent_url=s.ulai_agent_url,
                 api_key=s.ulai_api_key.get_secret_value(),
-                agent_api_key=s.ulai_agent_api_key.get_secret_value() or None,
                 system_secret=s.ulai_system_secret.get_secret_value() or None,
             )
             try:
@@ -194,6 +228,8 @@ class SdkGateway:
 
     async def close(self) -> None:
         await self._http.aclose()
+        if self._agents is not None:
+            await self._agents.close()
         if self._client is not None:
             await self._client.aclose()
 
@@ -212,20 +248,23 @@ class SdkGateway:
             events_token=info.events_token,
         )
 
-    async def join_agent(self, session_id, agent_id, participant_id, profile, custom_fields) -> None:
-        await self._do(
-            lambda c: c.agent.join_bridge(
-                room=session_id,
-                agent_id=agent_id,
-                participant_id=participant_id,
-                profile=profile,
-                opening=profile.get("opening"),
-                custom_fields=custom_fields,
+    async def join_agent(self, session_id, agent, participant_id, fields) -> None:
+        s = self.settings
+        # The agent server joins the session on the control plane with our key, as we would.
+        room = ua.Room(id=session_id, url=s.ulai_cp_url, token=s.ulai_api_key.get_secret_value())
+        try:
+            # Models, voices and languages come from the agent editor: Ulai judges them, not this SDK.
+            await self._agent_client().join(
+                room, agent, participant_id=participant_id, fields=fields, allow_unlisted_values=True
             )
-        )
+        except ua.AgentError as err:
+            raise UlaiError(_describe(err)) from err
 
     async def leave_agent(self, session_id, participant_id, reason) -> None:
-        await self._do(lambda c: c.agent.leave_bridge(session_id, participant_id, reason=reason))
+        try:
+            await self._agent_client().leave(session_id, participant_id=participant_id, reason=reason)
+        except ua.AgentError as err:
+            raise UlaiError(_describe(err)) from err
 
     async def terminate_session(self, session_id: str) -> None:
         async def go(c):
@@ -243,14 +282,29 @@ class SdkGateway:
     async def session_events(self, session_id: str, last_event_id: str | None) -> AsyncIterator[dict]:
         """The control plane's events for one session (participants joining and leaving, its end)."""
         token = await self.watch_session(session_id)
+        sub = {"action": "subscribe", "scope": "session", "session_id": session_id, "token": token}
+        async for msg in self._events(sub, last_event_id):
+            yield msg
+
+    async def project_events(self, last_event_id: str | None) -> AsyncIterator[dict]:
+        """The control plane's events for every session in our project, e.g. a phone call arriving."""
+        key = self.settings.ulai_api_key.get_secret_value()
+        if not key:
+            raise UlaiError("ULAI_API_KEY is not set")
+        async for msg in self._events({"action": "subscribe", "scope": "global", "key": key}, last_event_id):
+            yield msg
+
+    async def _events(self, sub: dict, last_event_id: str | None) -> AsyncIterator[dict]:
         base = self.settings.ulai_cp_url.replace("https://", "wss://").replace("http://", "ws://")
         async with websockets.connect(f"{base}/api/v1/events", open_timeout=10) as ws:
-            sub = {"action": "subscribe", "scope": "session", "session_id": session_id, "token": token}
             if last_event_id:
-                sub["last_event_id"] = last_event_id
+                sub = {**sub, "last_event_id": last_event_id}
             await ws.send(json.dumps(sub))
             async for raw in ws:
-                yield json.loads(raw)
+                msg = json.loads(raw)
+                if msg.get("type") == "error":
+                    raise UlaiError(f"Ulai events: {msg.get('message') or 'subscription refused'}")
+                yield msg
 
     async def originate(self, *, session_id, trunk_id, to_number, from_number) -> None:
         # The SDK's originate_call posts to a hard-coded address; this uses the configured one.
@@ -275,23 +329,17 @@ class SdkGateway:
         except httpx.HTTPError as err:
             raise UlaiError(_describe(err)) from err
 
-    # ----- agent streams -----
+    # ----- following a call's agent -----
 
-    def attach(self, session_id: str, profile: dict | None, tool_names: list[str]) -> AgentStream:
-        from ulai_api.proto import agent_session_pb2 as pb
-
-        if self._client is None:
-            raise UlaiError("Ulai client is not connected")
-        attach = pb.Attach(session_id=session_id, replay_history=True)
-        if profile:
-            attach.profile.CopyFrom(profile_to_pb(profile, pb))
-        first = pb.ClientEvent(attach=attach)
-        return _SdkAgentStream(self._client.agent, first, tool_names, pb)
-
-    async def assignments(self, agent_ids: list[str]) -> AsyncIterator[Any]:
-        client = await self._ready()
-        async for a in client.agent.subscribe(agent_ids=agent_ids, client_name="ulai-voice-studio"):
-            yield a
+    async def attach(self, session_id: str, tools: list[ua.Tool]) -> AgentSession:
+        # Without history: ulai-agents won't replay past tool calls to a client that answers tools.
+        try:
+            session = await self._agent_client().attach(session_id, tools=tools)
+        except (ua.NotFoundError, ua.CallEndedError) as err:
+            raise CallGone("The call has already ended", failed=False) from err
+        except ua.AgentError as err:
+            raise UlaiError(_describe(err)) from err
+        return _SdkAgentSession(session)
 
     # ----- trunks -----
 
@@ -350,14 +398,24 @@ class SdkGateway:
 
     # ----- inbound routing -----
 
+    # The rule names our agent; when its call arrives, the studio puts that agent into the session.
     async def create_rule(self, name, agent_id, trunk_id) -> RemoteRule:
         r = await self._do(
-            lambda c: c.dispatch.create_rule(name=name, agent_name=agent_id, trunk_ids=[trunk_id])
+            lambda c: c.dispatch.create_rule(
+                name=name,
+                agent_name=agent_id,
+                dispatch_metadata=_rule_metadata(agent_id),
+                trunk_ids=[trunk_id],
+            )
         )
         return RemoteRule(id=str(r.id))
 
     async def update_rule(self, rule_id, agent_id) -> None:
-        await self._do(lambda c: c.dispatch.update_rule(rule_id, agent_name=agent_id))
+        await self._do(
+            lambda c: c.dispatch.update_rule(
+                rule_id, agent_name=agent_id, dispatch_metadata=_rule_metadata(agent_id)
+            )
+        )
 
     async def delete_rule(self, rule_id) -> None:
         async def go(c):
@@ -368,53 +426,3 @@ class SdkGateway:
                     raise
 
         await self._do(go)
-
-
-def profile_to_pb(profile: dict, pb: Any) -> Any:
-    """Builds an AgentProfile message from the same dict join_bridge takes."""
-    out = pb.AgentProfile()
-    for field in (
-        "prompt",
-        "greeting",
-        "closing",
-        "voice",
-        "model",
-        "language",
-        "ai_backend",
-        "gemini_project_id",
-        "gemini_location",
-        "google_credentials_json",
-    ):
-        if profile.get(field):
-            setattr(out, field, str(profile[field]))
-    for field in (
-        "allow_interruptions",
-        "greeting_interruptible",
-        "backchannel_gate",
-        "silence_monitor",
-        "background_noise",
-        "live_transcription",
-        "amd_enabled",
-    ):
-        if profile.get(field) is not None:
-            setattr(out, field, bool(profile[field]))
-    if profile.get("temperature") is not None:
-        out.temperature = float(profile["temperature"])
-    if profile.get("max_call_duration_seconds"):
-        out.max_call_duration_seconds = int(profile["max_call_duration_seconds"])
-    if profile.get("initial_engagement_deadline_ms"):
-        out.initial_engagement_deadline_ms = int(profile["initial_engagement_deadline_ms"])
-    opening = profile.get("opening")
-    if opening == "caller":
-        out.opening = pb.OpeningTurn.OPENING_TURN_CALLER
-    elif opening == "agent":
-        out.opening = pb.OpeningTurn.OPENING_TURN_AGENT
-    for tool in profile.get("tools") or []:
-        spec = out.tools.add(name=tool["name"], description=tool.get("description", ""))
-        spec.required.extend(tool.get("required", []))
-        for pname, p in (tool.get("parameters") or {}).items():
-            param = spec.parameters[pname]
-            param.type = p.get("type", "string")
-            param.description = p.get("description", "")
-            param.enum.extend(str(e) for e in p.get("enum", []))
-    return out

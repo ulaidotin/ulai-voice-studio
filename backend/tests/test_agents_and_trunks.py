@@ -110,13 +110,13 @@ async def test_inbound_listener_recovers_to_idle_when_routing_is_removed(client,
     listener = app.state.services.inbound
     failing = True
 
-    async def assignments(agent_ids):
-        gateway.subscribed.append(agent_ids)
+    async def project_events(last_event_id):
+        gateway.subscribed.append(last_event_id)
         if failing:
-            raise RuntimeError("UNAUTHENTICATED invalid api key")
+            raise RuntimeError("Ulai events: invalid or disabled API key")
         yield  # pragma: no cover
 
-    gateway.assignments = assignments
+    gateway.project_events = project_events
     trunk = (
         await client.post(
             "/api/trunks/inbound", json={"name": "A", "numbers": ["+14155550100"], "agent_id": agent["id"]}

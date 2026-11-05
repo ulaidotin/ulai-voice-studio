@@ -3,9 +3,11 @@ from types import SimpleNamespace
 
 import httpx
 
-from app.ulai.profile import build_profile, render
+from app.ulai.gateway import CallGone
+from app.ulai.inbound import inbound_call
+from app.ulai.profile import build_agent, render
 
-from .conftest import AGENT, ended, eventually, said, started, tool_call, usage
+from .conftest import AGENT, caller_arrived, ended, eventually, said, tool_call, usage
 
 
 async def _call(client, call_id):
@@ -37,36 +39,34 @@ async def test_web_call_end_to_end(client, agent, gateway, app):
     assert web["ticket"] == "ticket-1" and web["node_address"] == "node.example:443"
     assert web["ice_servers"][0]["urls"] == ["stun:stun.l.google.com:19302"]
 
-    # The agent got the rendered profile, the Gemini credentials and the tool definitions.
-    ((_, session_id, agent_id, _, profile, custom),) = gateway.calls("join_agent")
-    assert agent_id == agent["id"]
-    assert profile["prompt"] == "You help Ana with order ."
-    assert profile["greeting"] == "Hi Ana!"
-    assert profile["voice"] == "Kore" and profile["gemini_project_id"] == "gcp-proj"
-    assert profile["google_credentials_json"]
-    assert profile["tools"][0]["required"] == ["order_id"]
-    assert custom["customer_name"] == "Ana"
+    # The agent got the rendered prompt, the Gemini credentials and the tool definitions.
+    ((_, session_id, sent, _, fields),) = gateway.calls("join_agent")
+    assert sent.id == agent["id"]
+    assert sent.instructions == "You help Ana with order ."
+    assert sent.greeting == "Hi Ana!"
+    assert sent.voice == "Kore" and sent.cloud.project == "gcp-proj" and sent.cloud.credentials_json
+    assert sent.tools[0].name == "check_order" and sent.tools[0].required == ["order_id"]
+    assert fields["customer_name"] == "Ana"
 
-    q = gateway.agent_queues[session_id]
-    await q.put(started())
+    # Attached: the call is live, and we answer the agent's tools.
     await eventually(_status_is(client, web["call_id"], "in_progress"))
-    await q.put(said(2, "agent", "Hi Ana!"))
-    await q.put(said(3, "caller", "Where is my ord", final=False))
-    await q.put(said(4, "caller", "Where is my order A-17?"))
-    await q.put(tool_call(5, "check_order", {"order_id": "A-17"}))
+    assert gateway.calls("attach")[0][2] == ["check_order"]
+    q = gateway.agent_queues[session_id]
+    await q.put(said("agent", "Hi Ana!"))
+    await q.put(said("caller", "Where is my ord", final=False))
+    await q.put(said("caller", "Where is my order A-17?"))
+    await q.put(tool_call("check_order", {"order_id": "A-17"}))
 
-    stream = gateway.streams[0]
-    assert gateway.calls("attach")[0][3] == ["check_order"]  # told Ulai we answer this tool
+    session = gateway.sessions[0]
 
     async def tool_answered():
-        return stream.sent
+        return session.answers
 
     await eventually(tool_answered)
-    result = stream.sent[0].tool_result
-    assert result.name == "check_order" and json.loads(result.result_json) == {"status": "shipped"}
+    assert session.answers == [("check_order", {"status": "shipped"})]
 
-    await q.put(usage(6, 1200, 300))
-    await q.put(ended(7))
+    await q.put(usage(1200, 300))
+    await q.put(ended())
     call = await eventually(_status_is(client, web["call_id"], "completed"))
 
     assert call["end_reason"] == "caller hung up"
@@ -79,26 +79,32 @@ async def test_web_call_end_to_end(client, agent, gateway, app):
     assert tool["data"]["result"] == {"status": "shipped"} and tool["data"]["ok"]
 
 
-async def test_reattaching_does_not_duplicate_the_transcript(client, agent, gateway):
+async def test_a_dropped_agent_stream_is_reattached(client, agent, gateway):
     web = (await client.post("/api/calls/web", json={"agent_id": agent["id"]})).json()
     session_id = gateway.calls("join_agent")[0][1]
     q = gateway.agent_queues[session_id]
-    await q.put(started())
-    await q.put(said(2, "agent", "Hello"))
+    await q.put(said("agent", "Hello"))
     await q.put(None)  # the stream drops
 
-    # On re-attach Ulai replays history; already-stored lines must be skipped.
     async def reattached():
         return len(gateway.calls("attach")) >= 2
 
     await eventually(reattached, within=5)
-    await q.put(started())
-    await q.put(said(2, "agent", "Hello"))
-    await q.put(said(3, "caller", "Hi"))
-    await q.put(ended(4))
+    assert gateway.calls("attach")[1][2] == ["check_order"]  # still answering the agent's tools
+    await q.put(said("caller", "Hi"))
+    await q.put(ended())
     call = await eventually(_status_is(client, web["call_id"], "completed"), within=5)
     texts = [e["text"] for e in call["events"] if e["kind"] == "transcript"]
     assert texts == ["Hello", "Hi"]
+
+
+async def test_a_call_ulai_lost_is_recorded_as_failed(client, agent, gateway):
+    web = (await client.post("/api/calls/web", json={"agent_id": agent["id"]})).json()
+    session_id = gateway.calls("join_agent")[0][1]
+    await gateway.agent_queues[session_id].put(CallGone("the model failed to connect", failed=True))
+    call = await eventually(_status_is(client, web["call_id"], "failed"))
+    assert "the model failed to connect" in call["error"]
+    assert len(gateway.calls("attach")) == 1  # not retried: the call is gone
 
 
 async def _outbound_setup(client):
@@ -182,30 +188,70 @@ async def test_failed_dial_is_recorded_and_the_session_closed(client, agent, gat
     assert gateway.calls("terminate_session")
 
 
-async def test_inbound_assignment_is_answered_with_the_agents_profile(client, agent, gateway, app):
+async def test_an_inbound_caller_gets_the_rules_agent(client, agent, gateway, app):
     await client.post(
         "/api/trunks/inbound", json={"name": "Main", "numbers": ["+14155550100"], "agent_id": agent["id"]}
     )
 
     async def subscribed():
-        return gateway.subscribed and gateway.subscribed[-1] == [agent["id"]]
+        return gateway.subscribed
 
     await eventually(subscribed)
 
-    info = SimpleNamespace(agent_id=agent["id"], from_number="+14155550777", to_number="+14155550100")
-    await gateway.assignment_queue.put(SimpleNamespace(session_id="sess-in-1", call=info))
+    # Ignored: our own outbound leg, and a caller for an agent this studio doesn't have.
+    await gateway.project_queue.put(
+        caller_arrived("sess-out", agent["id"], "+14155550199", "+14155550777", direction="OUTBOUND")
+    )
+    await gateway.project_queue.put(caller_arrived("sess-other", "someone-elses-agent", "+1", "+2"))
+    await gateway.project_queue.put(caller_arrived("sess-in-1", agent["id"], "+14155550777", "+14155550100"))
 
     async def attached():
         return gateway.calls("attach")
 
-    ((_, session_id, profile, tools),) = await eventually(attached)
-    assert session_id == "sess-in-1"
-    assert profile["prompt"] == "You help there with order ."  # defaults fill in for inbound calls
-    assert tools == ["check_order"]
+    ((_, session_id, tools),) = await eventually(attached)
+    assert session_id == "sess-in-1" and tools == ["check_order"]
+    # The studio put the agent in, as for an outbound call; defaults fill in its variables.
+    ((_, joined_session, sent, _, fields),) = gateway.calls("join_agent")
+    assert joined_session == "sess-in-1" and sent.id == agent["id"]
+    assert sent.instructions == "You help there with order ."
+    assert fields["direction"] == "inbound"
 
     calls = (await client.get("/api/calls", params={"direction": "inbound"})).json()["items"]
+    assert len(calls) == 1
     assert calls[0]["from_number"] == "+14155550777" and calls[0]["status"] == "in_progress"
     assert calls[0]["trunk_id"]
+
+    # The same caller announced twice (e.g. after the listener reconnects) is answered once.
+    await gateway.project_queue.put(caller_arrived("sess-in-1", agent["id"], "+14155550777", "+14155550100"))
+    await gateway.project_queue.put(caller_arrived("sess-in-2", agent["id"], "+14155550778", "+14155550100"))
+    await eventually(lambda: _async(len(gateway.calls("join_agent")) == 2))
+    assert [c[1] for c in gateway.calls("join_agent")] == ["sess-in-1", "sess-in-2"]
+
+
+async def test_an_inbound_caller_is_hung_up_on_if_the_agent_cant_start(client, agent, gateway):
+    await client.post(
+        "/api/trunks/inbound", json={"name": "Main", "numbers": ["+14155550100"], "agent_id": agent["id"]}
+    )
+    await eventually(lambda: _async(gateway.subscribed))
+    gateway.fail.add("join_agent")
+    await gateway.project_queue.put(caller_arrived("sess-in-1", agent["id"], "+14155550777", "+14155550100"))
+    await eventually(lambda: _async(gateway.calls("terminate_session")))
+    call = (await client.get("/api/calls", params={"direction": "inbound"})).json()["items"][0]
+    assert call["status"] == "failed" and "join_agent failed" in call["error"]
+
+
+def test_inbound_call_reads_the_sip_gateways_metadata():
+    msg = caller_arrived("s1", "agent-1", "+14155550777", "+14155550100")
+    assert inbound_call(msg) == ("s1", "agent-1", "+14155550777", "+14155550100")
+    # The rule's dispatch metadata names the agent when assigned_agent is empty.
+    msg["metadata"] = {"assigned_agent": "", "studio_agent_id": "agent-2", "direction": "inbound"}
+    assert inbound_call(msg)[1] == "agent-2"
+    assert inbound_call({**msg, "type": "participant_left"}) is None
+    assert inbound_call({**msg, "kind": "STANDARD"}) is None
+
+
+async def _async(value):
+    return value
 
 
 async def test_end_call_from_the_studio(client, agent, gateway):
@@ -240,6 +286,7 @@ def test_placeholders():
 
 def test_voicemail_detection_only_on_outbound(settings):
     agent = SimpleNamespace(
+        id="a1",
         prompt="",
         greeting="",
         closing="",
@@ -258,19 +305,17 @@ def test_voicemail_detection_only_on_outbound(settings):
         engagement_timeout_seconds=10,
         tools=[],
     )
-    assert build_profile(agent, settings, {}, direction="outbound")["amd_enabled"] is True
-    assert build_profile(agent, settings, {}, direction="inbound")["amd_enabled"] is False
+    assert build_agent(agent, settings, {}, direction="outbound").options.voicemail_detection is True
+    assert build_agent(agent, settings, {}, direction="inbound").options.voicemail_detection is False
 
 
 async def test_test_call_can_use_unsaved_edits(client, agent, gateway):
     draft = {**AGENT, "greeting": "Draft hello", "voice": "Puck", "opening": "caller"}
     resp = await client.post("/api/calls/web", json={"agent_id": agent["id"], "draft": draft})
     assert resp.status_code == 200, resp.text
-    ((_, _, agent_id, _, profile, _),) = gateway.calls("join_agent")
-    assert agent_id == agent["id"]
-    assert (
-        profile["greeting"] == "Draft hello" and profile["voice"] == "Puck" and profile["opening"] == "caller"
-    )
+    ((_, _, sent, _, _),) = gateway.calls("join_agent")
+    assert sent.id == agent["id"]
+    assert sent.greeting == "Draft hello" and sent.voice == "Puck" and sent.opening == "caller"
     # The saved agent is untouched.
     saved = (await client.get(f"/api/agents/{agent['id']}")).json()
     assert saved["greeting"] == AGENT["greeting"] and saved["voice"] == "Kore"

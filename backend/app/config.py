@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     ulai_api_key: SecretStr = SecretStr("")
     ulai_api_url: str = "https://backend.ulai.co.in"
     ulai_cp_url: str = "https://cp.ulai.co.in"
+    # The agent server, for ulai-agents: https://host[:port] uses TLS, http://host:port doesn't.
     ulai_agent_url: str = "https://stgags.ulai.co"
     ulai_agent_api_key: SecretStr = SecretStr("")
     # Sent as X-System-Secret to the SIP originate service.
@@ -56,7 +57,6 @@ class Settings(BaseSettings):
     # Relative to the working directory: /app in Docker, the repo root or backend/ locally.
     google_credentials_path: Path = Field(default_factory=lambda: _default_credentials_path())
     gemini_location: str = "us-central1"
-    ai_backend: str = "gemini-live"
 
     # --- Calls ---
     # Outbound calls that aren't answered within this many seconds are ended as "no answer".

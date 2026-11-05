@@ -1,13 +1,14 @@
 import asyncio
 import json
 from collections import defaultdict
+from datetime import timedelta
 from typing import Any
 
 import bcrypt
 import httpx
 import pytest
+import ulai_agents as ua
 from sqlalchemy.ext.asyncio import create_async_engine
-from ulai_api.proto import agent_session_pb2 as pb
 
 from app.config import Settings, get_settings
 from app.db import Base
@@ -17,26 +18,34 @@ from app.ulai.gateway import RemoteRule, RemoteTrunk, UlaiError, UserJoin
 PASSWORD = "correct horse battery staple"
 
 
-class FakeStream:
-    def __init__(self, gw: "FakeGateway", session_id: str):
+class FakeSession:
+    """An attached call, as ulai-agents gives it: events in order, tools answered in the background."""
+
+    def __init__(self, gw: "FakeGateway", session_id: str, tools: list[ua.Tool]):
         self.gw = gw
         self.session_id = session_id
-        self.sent: list[Any] = []
+        self.tools = {t.name: t for t in tools}
+        self.answers: list[tuple[str, Any]] = []
         self.closed = False
 
-    def send(self, event: Any) -> None:
-        self.sent.append(event)
-
-    def close(self) -> None:
-        self.closed = True
-
-    async def __aiter__(self):
+    async def events(self):
         q = self.gw.agent_queues[self.session_id]
         while True:
             ev = await q.get()
-            if ev is None:
+            if ev is None:  # the stream drops
                 return
+            if isinstance(ev, Exception):
+                raise ev
+            tool = self.tools.get(ev.name) if isinstance(ev, ua.ToolCall) else None
+            if tool is not None and tool.handler is not None:
+                asyncio.ensure_future(self._answer(tool, ev.args))
             yield ev
+
+    async def _answer(self, tool: ua.Tool, args: dict) -> None:
+        self.answers.append((tool.name, await tool.handler(args)))
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class FakeGateway:
@@ -48,9 +57,9 @@ class FakeGateway:
         self.fail: set[str] = set()
         self.agent_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         self.session_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
-        self.streams: list[FakeStream] = []
-        self.assignment_queue: asyncio.Queue = asyncio.Queue()
-        self.subscribed: list[list[str]] = []
+        self.sessions: list[FakeSession] = []
+        self.project_queue: asyncio.Queue = asyncio.Queue()
+        self.subscribed: list[str | None] = []
         self._n = 0
 
     def _id(self, prefix: str) -> str:
@@ -79,8 +88,9 @@ class FakeGateway:
         self._record("join_user", session_id, participant_id)
         return UserJoin(session_id, f"conn-{participant_id}", "ticket-1", "node.example:443", "events-1")
 
-    async def join_agent(self, session_id, agent_id, participant_id, profile, custom_fields):
-        self._record("join_agent", session_id, agent_id, participant_id, profile, custom_fields)
+    async def join_agent(self, session_id, agent, participant_id, fields):
+        agent.validate(allow_unlisted_values=True)  # as ulai-agents does before sending it
+        self._record("join_agent", session_id, agent, participant_id, fields)
 
     async def leave_agent(self, session_id, participant_id, reason):
         self._record("leave_agent", session_id, participant_id, reason)
@@ -99,19 +109,19 @@ class FakeGateway:
                 return
             yield msg
 
+    async def project_events(self, last_event_id):
+        self.subscribed.append(last_event_id)
+        while True:
+            yield await self.project_queue.get()
+
     async def originate(self, *, session_id, trunk_id, to_number, from_number):
         self._record("originate", session_id, trunk_id, to_number, from_number)
 
-    def attach(self, session_id, profile, tool_names):
-        self._record("attach", session_id, profile, tool_names)
-        stream = FakeStream(self, session_id)
-        self.streams.append(stream)
-        return stream
-
-    async def assignments(self, agent_ids):
-        self.subscribed.append(agent_ids)
-        while True:
-            yield await self.assignment_queue.get()
+    async def attach(self, session_id, tools):
+        self._record("attach", session_id, [t.name for t in tools])
+        session = FakeSession(self, session_id, tools)
+        self.sessions.append(session)
+        return session
 
     async def create_inbound_trunk(self, name, numbers, allowed):
         self._record("create_inbound_trunk", name, numbers, allowed)
@@ -144,32 +154,43 @@ class FakeGateway:
         self._record("delete_rule", rule_id)
 
 
-# ---- proto event builders ----
+# ---- ulai_agents event builders ----
 
 
-def started(seq=1):
-    return pb.ServerEvent(sequence=seq, session_started=pb.SessionStarted(session_id="s"))
-
-
-def said(seq, speaker, text, final=True, elapsed=0):
-    sp = pb.Speaker.SPEAKER_AGENT if speaker == "agent" else pb.Speaker.SPEAKER_CALLER
-    return pb.ServerEvent(
-        sequence=seq, elapsed_ms=elapsed, transcript=pb.Transcript(speaker=sp, text=text, final=final)
+def said(speaker, text, final=True, elapsed_ms=0):
+    return ua.Transcript(
+        speaker=ua.Speaker(speaker), text=text, final=final, elapsed=timedelta(milliseconds=elapsed_ms)
     )
 
 
-def tool_call(seq, name, args, call_id="tc-1"):
-    return pb.ServerEvent(
-        sequence=seq, tool_call=pb.ToolCall(id=call_id, name=name, args_json=json.dumps(args))
-    )
+def tool_call(name, args, call_id="tc-1"):
+    return ua.ToolCall(id=call_id, name=name, args=args, args_json=json.dumps(args))
 
 
-def usage(seq, prompt, response):
-    return pb.ServerEvent(sequence=seq, usage=pb.UsageReport(prompt_total=prompt, response_total=response))
+def usage(prompt, response):
+    return ua.Usage(prompt_total=prompt, response_total=response)
 
 
-def ended(seq, reason="caller hung up", disposition="completed"):
-    return pb.ServerEvent(sequence=seq, session_ended=pb.SessionEnded(reason=reason, disposition=disposition))
+def ended(reason="caller hung up", disposition="completed"):
+    return ua.Ended(reason=reason, disposition=disposition)
+
+
+def caller_arrived(session_id, agent_id, from_number, to_number, direction="INBOUND", event_id="e1"):
+    """The control plane announcing a phone caller joining a session, as the SIP gateway joins it."""
+    return {
+        "id": event_id,
+        "type": "participant_joined",
+        "session_id": session_id,
+        "kind": "SIP",
+        "sip_direction": direction,
+        "metadata": {
+            "assigned_agent": agent_id,
+            "caller_id": from_number,
+            "phone_number": to_number,
+            "direction": direction.lower(),
+            "role": "telephony",
+        },
+    }
 
 
 async def eventually(check, within=3.0):

@@ -19,16 +19,16 @@ One admin account, no sign-up.
 ```
 Browser ──(ulai-js-sdk: WebRTC audio)──────────────▶ Ulai media node
    │
-   └─ /api ─▶ Next.js ─▶ FastAPI backend ──(ulai-api SDK)──▶ Ulai: sessions, SIP trunks,
-                              │                              dispatch rules, hosted Gemini agents
+   └─ /api ─▶ Next.js ─▶ FastAPI backend ──(ulai-api SDK)─────▶ Ulai: sessions, SIP trunks, dispatch rules
+                              │         └──(ulai-agents SDK)──▶ Ulai agent server: hosted Gemini agents
                               └─▶ Postgres
 ```
 
-- **The backend owns the agents**, because Ulai doesn't store them. For each call it sends the agent's profile (prompt, voice, tools, Gemini credentials) to Ulai's hosted agent, then attaches to the call's event stream. It saves the transcript and answers tool calls by calling the tool's URL.
+- **The backend owns the agents**, because Ulai doesn't store them. For each call it puts the agent (prompt, voice, tools, Gemini credentials) into the call's session with [ulai-agents](https://github.com/ulaidotin/agent-sdk-python), then attaches to the call. It saves the transcript and answers tool calls by calling the tool's URL.
 - **Web calls.** The backend creates the session, puts the agent in it, and hands the browser a short-lived join ticket. The Ulai API key never reaches the browser.
 - **Outbound calls.** The backend creates the session, joins the agent, dials through the trunk, and follows the phone leg on Ulai's control plane to see pick-up and hang-up.
-- **Inbound calls.** Each inbound trunk with an agent gets a Ulai dispatch rule. The backend subscribes to call assignments for those agents and attaches with the agent's profile when a call arrives.
-- **Restarts.** The backend picks in-flight calls back up on restart. Ulai replays each call's history, and lines already saved aren't stored twice.
+- **Inbound calls.** Each inbound trunk with an agent gets a Ulai dispatch rule naming that agent. The backend watches the project's events on Ulai's control plane; when a caller arrives for one of its agents, it puts that agent into the caller's session, as for an outbound call.
+- **Restarts.** The backend picks in-flight calls back up on restart. Ulai doesn't replay what was said while the backend was down, so those lines are missing from the transcript.
 
 ## Run it
 
